@@ -244,3 +244,30 @@ def test_a_writer_whose_clock_runs_ahead_is_still_trusted(redis_server):
         redis_server.hset(meta_key, "m", json.dumps(meta))
         turn2 = _compress(b, history + [{"role": "user", "content": "y"}], session_id="conv-skew")
         assert turn2["session"]["frozen_message_count"] >= len(turn1["messages"])
+
+
+def test_a_lost_message_is_noticed_even_beside_unreferenced_ones(redis_server):
+    history = _big_tool_history()
+    with _replica() as a, _replica() as b:
+        _compress(a, history, session_id="conv-masked")
+        msgs_key = _meta_key(redis_server).replace(b":meta", b":msgs")
+        # Old variants left behind outnumber the one referenced message lost.
+        redis_server.hset(msgs_key, mapping={f"old{i}": "{}" for i in range(5)})
+        redis_server.hdel(msgs_key, redis_server.hkeys(msgs_key)[0])
+        history2 = history + [{"role": "user", "content": "y"}]
+        turn2 = _compress(a, history2, session_id="conv-masked")
+        turn3 = _compress(
+            b, history2 + [{"role": "user", "content": "z"}], session_id="conv-masked"
+        )
+        assert turn3["session"]["frozen_message_count"] >= len(turn2["messages"])
+
+
+def test_a_corrupt_token_never_fails_a_turn_and_is_replaced(redis_server):
+    history = _big_tool_history()
+    with _replica() as a, _replica() as b:
+        _compress(a, history, session_id="conv-token")
+        redis_server.hset(_meta_key(redis_server), "t", b"\xff")
+        history2 = history + [{"role": "user", "content": "y"}]
+        turn2 = _compress(b, history2, session_id="conv-token")
+        turn3 = _compress(a, history2 + [{"role": "user", "content": "z"}], session_id="conv-token")
+        assert turn3["session"]["frozen_message_count"] >= len(turn2["messages"])

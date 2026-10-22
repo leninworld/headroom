@@ -57,12 +57,15 @@ _CHUNK = 256
 
 # Install ARGV[2] as the token and ARGV[3] as the metadata if the token is still
 # ARGV[1] ("" when the key must not exist) and the messages hash (KEYS[2]) holds
-# at least the ARGV[5] distinct messages the metadata references. 1 on success,
-# 0 when another replica wrote first, 2 when the messages hash lost entries.
+# every message the metadata references (ARGV[5:], the ones this write did not
+# send). 1 on success, 0 when another replica wrote first, 2 when the messages
+# hash lost one.
 _CAS = """
 local t = redis.call('HGET', KEYS[1], 't') or ''
 if t ~= ARGV[1] then return 0 end
-if redis.call('HLEN', KEYS[2]) < tonumber(ARGV[5]) then return 2 end
+for i = 5, #ARGV do
+  if redis.call('HEXISTS', KEYS[2], ARGV[i]) == 0 then return 2 end
+end
 redis.call('HSET', KEYS[1], 't', ARGV[2], 'm', ARGV[3])
 redis.call('PEXPIRE', KEYS[1], ARGV[4])
 return 1
@@ -93,18 +96,27 @@ class SharedSessions:
             if local is not None:  # lost or expired: the next write stores it whole
                 local.shared_token, local.shared_digests = "", frozenset()
             return None
-        if local is not None and _text(token) == local.shared_token:
-            return None
+        try:
+            if local is not None and _text(token) == local.shared_token:
+                return None
+        except UnicodeDecodeError:
+            return self._drop(local, meta_key, msgs_key)
         row = self._guard.call("read", lambda: self._client.hmget(meta_key, "t", "m"), None)
         if row is None:
             return None
+        if row[0] is None:  # expired between the two reads
+            return None
         try:
-            token, meta = _text(row[0]), json.loads(_text(row[1]))
+            token = _text(row[0])
+        except UnicodeDecodeError:
+            return self._drop(local, meta_key, msgs_key)
+        try:
+            meta = json.loads(_text(row[1]))
             digests = meta.pop("table")
             if not isinstance(digests, list) or not all(isinstance(d, str) for d in digests):
                 raise ValueError("table is not a list of digests")
         except (TypeError, ValueError, KeyError, AttributeError, IndexError):
-            return self._unusable(local, row[0], "metadata", meta_key)
+            return self._unusable(local, token, "metadata", meta_key)
         held = self._held(store, key, local)
         missing = [d for d in dict.fromkeys(digests) if d not in held]
         for start in range(0, len(missing), _CHUNK):
@@ -134,18 +146,25 @@ class SharedSessions:
 
     @staticmethod
     def _unusable(
-        local: PrefixCacheTracker | None, token: Any, what: str, name: str
+        local: PrefixCacheTracker | None, token: str, what: str, name: str
     ) -> PrefixCacheTracker | None:
         """Shared state this replica cannot use (evicted, corrupt or altered):
         keep its own, and claim the current token with no messages known to be
         stored, so its next write replaces the session whole."""
         logger.warning("compress sessions: unusable %s in %s; this replica rewrites it", what, name)
         if local is not None:
-            try:
-                local.shared_token = _text(token)
-            except UnicodeDecodeError:
-                local.shared_token = token.decode("utf-8", "replace")
-            local.shared_digests = frozenset()
+            local.shared_token, local.shared_digests = token, frozenset()
+        return None
+
+    def _drop(
+        self, local: PrefixCacheTracker | None, meta_key: str, msgs_key: str
+    ) -> PrefixCacheTracker | None:
+        """A token that is not text cannot be claimed: delete the session, so
+        the next write stores it whole."""
+        logger.warning("compress sessions: corrupt token in %s; deleting the session", meta_key)
+        self._guard.call("write", lambda: self._client.delete(meta_key, msgs_key), 0)
+        if local is not None:
+            local.shared_token, local.shared_digests = "", frozenset()
         return None
 
     def publish(self, store: SessionTrackerStore, key: str, tracker: PrefixCacheTracker) -> None:
@@ -161,17 +180,17 @@ class SharedSessions:
         meta_json = json.dumps(meta)
         ttl_ms = max(1000, int(tracker.retention_seconds() * 1000))
         meta_key, msgs_key = self._keys(key)
-        distinct = len(set(digests))
 
         def write(known: frozenset[str]) -> tuple[int, str]:
             new = [(d, m) for d, m in zip(digests, table, strict=True) if d not in known]
+            assumed = sorted(set(digests) & known)  # stored by an earlier write
             token = uuid.uuid4().hex
             pipe = self._client.pipeline(transaction=False)
             for start in range(0, len(new), _CHUNK):
                 pipe.hset(msgs_key, mapping=dict(new[start : start + _CHUNK]))
             pipe.pexpire(msgs_key, ttl_ms)
             pipe.execute()
-            args = [tracker.shared_token, token, meta_json, ttl_ms, distinct]
+            args = [tracker.shared_token, token, meta_json, ttl_ms, *assumed]
             return int(self._cas(keys=[meta_key, msgs_key], args=args)), token
 
         result = self._guard.call("write", lambda: write(tracker.shared_digests), None)
