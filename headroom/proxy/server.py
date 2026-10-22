@@ -1203,6 +1203,11 @@ class HeadroomProxy(
                 session_ttl_seconds=config.prefix_freeze_session_ttl,
             )
         )
+        # Session-aware /v1/compress state in Redis, so any replica serves any
+        # turn (HEADROOM_COMPRESS_SESSION_STORE); None keeps it in memory.
+        from headroom.cache.shared_sessions import open_shared_sessions
+
+        self.shared_compress_sessions = open_shared_sessions()
         # Set by startup() when HEADROOM_PREFIX_STATE_FILE opts in.
         self._prefix_state_file: str | None = None
 

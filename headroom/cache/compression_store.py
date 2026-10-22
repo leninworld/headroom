@@ -1232,6 +1232,13 @@ def _create_default_ccr_backend() -> CompressionStoreBackend | None:
     from ..paths import persistence_allowed
 
     backend_type = (os.environ.get("HEADROOM_CCR_BACKEND") or "").strip().lower()
+    session_store = os.environ.get("HEADROOM_COMPRESS_SESSION_STORE", "").strip()
+    if not backend_type and session_store:
+        # Replicas sharing compress sessions share the CCR store too: a marker
+        # in a replayed transcript must resolve on whichever replica serves it.
+        from .backends.redis import RedisBackend
+
+        return RedisBackend(session_store)
     if backend_type == "memory":
         return None
     if not backend_type or backend_type == "sqlite":
