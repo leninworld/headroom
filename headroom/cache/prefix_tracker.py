@@ -2271,7 +2271,10 @@ class SessionTrackerStore:
         expired. Raises on malformed input. Does not install it."""
         if not isinstance(meta, dict):
             raise ValueError("tracker metadata is not an object")
-        return self._decode_tracker({"meta": meta, "messages": messages}, time.time())
+        now = time.time()
+        # Written on another host: a clock ahead of ours is not a future stamp.
+        meta = {**meta, "last_activity": min(float(meta["last_activity"]), now)}
+        return self._decode_tracker({"meta": meta, "messages": messages}, now)
 
     def install(self, key: str, tracker: PrefixCacheTracker) -> None:
         """Make ``tracker`` the one under ``key``. Call on the event loop, or

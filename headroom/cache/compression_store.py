@@ -1266,7 +1266,7 @@ def _create_default_ccr_backend() -> CompressionStoreBackend | None:
             # registered as "redis" still wins, above.
             from .backends.redis import RedisBackend
 
-            url = os.environ.get("HEADROOM_REDIS_URL", "").strip()
+            url = os.environ.get("HEADROOM_REDIS_URL", "").strip() or session_store
             if not url:
                 logger.error(
                     "HEADROOM_CCR_BACKEND=redis needs HEADROOM_REDIS_URL; using the "

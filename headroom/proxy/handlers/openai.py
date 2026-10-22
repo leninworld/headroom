@@ -11190,8 +11190,13 @@ class OpenAIHandlerMixin:
             except TimeoutError:
                 newer = None  # answer from this replica's state, as without the store
             if newer is not None:
-                self.session_tracker_store.install(_session_key, newer)
-                tracker = newer
+                current = self.session_tracker_store.peek(_session_key)
+                if current is _local:
+                    self.session_tracker_store.install(_session_key, newer)
+                    tracker = newer
+                else:
+                    # A local turn installed a tracker meanwhile: it is newer.
+                    tracker = current
         if tracker is None:
             return self._compress_usage_unknown_session(session_id)
         # No create, no LRU bump: the cache is only needed for its turn lock.

@@ -56,11 +56,13 @@ STORE_ENV = "HEADROOM_COMPRESS_SESSION_STORE"
 _CHUNK = 256
 
 # Install ARGV[2] as the token and ARGV[3] as the metadata if the token is still
-# ARGV[1] ("" when the key must not exist). 1 on success, 0 when another
-# replica wrote first.
+# ARGV[1] ("" when the key must not exist) and the messages hash (KEYS[2]) holds
+# at least the ARGV[5] distinct messages the metadata references. 1 on success,
+# 0 when another replica wrote first, 2 when the messages hash lost entries.
 _CAS = """
 local t = redis.call('HGET', KEYS[1], 't') or ''
 if t ~= ARGV[1] then return 0 end
+if redis.call('HLEN', KEYS[2]) < tonumber(ARGV[5]) then return 2 end
 redis.call('HSET', KEYS[1], 't', ARGV[2], 'm', ARGV[3])
 redis.call('PEXPIRE', KEYS[1], ARGV[4])
 return 1
@@ -94,12 +96,15 @@ class SharedSessions:
         if local is not None and _text(token) == local.shared_token:
             return None
         row = self._guard.call("read", lambda: self._client.hmget(meta_key, "t", "m"), None)
-        try:
-            token, meta = _text(row[0]), json.loads(row[1])
-            digests = list(meta.pop("table"))
-        except (TypeError, ValueError, KeyError, AttributeError, IndexError):
-            logger.warning("compress sessions: ignoring malformed state for %s", meta_key)
+        if row is None:
             return None
+        try:
+            token, meta = _text(row[0]), json.loads(_text(row[1]))
+            digests = meta.pop("table")
+            if not isinstance(digests, list) or not all(isinstance(d, str) for d in digests):
+                raise ValueError("table is not a list of digests")
+        except (TypeError, ValueError, KeyError, AttributeError, IndexError):
+            return self._unusable(local, row[0], "metadata", meta_key)
         held = self._held(store, key, local)
         missing = [d for d in dict.fromkeys(digests) if d not in held]
         for start in range(0, len(missing), _CHUNK):
@@ -110,21 +115,38 @@ class SharedSessions:
             if values is None:
                 return None
             for digest, value in zip(part, values, strict=True):
-                if value is None or _digest(_text(value)) != digest:
-                    # Evicted or altered: keep ours, and store the session whole
-                    # on the next write.
-                    if local is not None:
-                        local.shared_token, local.shared_digests = "", frozenset()
-                    return None
-                held[digest] = _text(value)
+                try:
+                    text = None if value is None else _text(value)
+                except UnicodeDecodeError:
+                    text = None
+                if text is None or _digest(text) != digest:
+                    return self._unusable(local, token, "messages", msgs_key)
+                held[digest] = text
         try:
             tracker = store.decode_shared(meta, [json.loads(held[d]) for d in digests])
-        except (TypeError, ValueError, KeyError, AttributeError):
-            logger.warning("compress sessions: ignoring malformed state for %s", meta_key)
+        except (TypeError, ValueError, KeyError, AttributeError, OverflowError):
+            return self._unusable(local, token, "metadata", meta_key)
+        if tracker is None:
+            logger.info("compress sessions: shared state for %s has expired", meta_key)
             return None
-        if tracker is not None:
-            tracker.shared_token, tracker.shared_digests = token, frozenset(digests)
+        tracker.shared_token, tracker.shared_digests = token, frozenset(digests)
         return tracker
+
+    @staticmethod
+    def _unusable(
+        local: PrefixCacheTracker | None, token: Any, what: str, name: str
+    ) -> PrefixCacheTracker | None:
+        """Shared state this replica cannot use (evicted, corrupt or altered):
+        keep its own, and claim the current token with no messages known to be
+        stored, so its next write replaces the session whole."""
+        logger.warning("compress sessions: unusable %s in %s; this replica rewrites it", what, name)
+        if local is not None:
+            try:
+                local.shared_token = _text(token)
+            except UnicodeDecodeError:
+                local.shared_token = token.decode("utf-8", "replace")
+            local.shared_digests = frozenset()
+        return None
 
     def publish(self, store: SessionTrackerStore, key: str, tracker: PrefixCacheTracker) -> None:
         """Write the messages Redis lacks, then the metadata unless another
@@ -135,36 +157,55 @@ class SharedSessions:
             logger.debug("compress sessions: tracker not shareable (%s)", exc)
             return
         digests = [_digest(m) for m in table]
-        new = [
-            (d, m) for d, m in zip(digests, table, strict=True) if d not in tracker.shared_digests
-        ]
         meta["table"] = digests
-        token = uuid.uuid4().hex
+        meta_json = json.dumps(meta)
         ttl_ms = max(1000, int(tracker.retention_seconds() * 1000))
         meta_key, msgs_key = self._keys(key)
+        distinct = len(set(digests))
 
-        def write() -> int:
+        def write(known: frozenset[str]) -> tuple[int, str]:
+            new = [(d, m) for d, m in zip(digests, table, strict=True) if d not in known]
+            token = uuid.uuid4().hex
             pipe = self._client.pipeline(transaction=False)
             for start in range(0, len(new), _CHUNK):
                 pipe.hset(msgs_key, mapping=dict(new[start : start + _CHUNK]))
             pipe.pexpire(msgs_key, ttl_ms)
             pipe.execute()
-            return int(
-                self._cas(
-                    keys=[meta_key], args=[tracker.shared_token, token, json.dumps(meta), ttl_ms]
-                )
-            )
+            args = [tracker.shared_token, token, meta_json, ttl_ms, distinct]
+            return int(self._cas(keys=[meta_key, msgs_key], args=args)), token
 
-        written = self._guard.call("write", write, None)
+        result = self._guard.call("write", lambda: write(tracker.shared_digests), None)
+        if result is not None and result[0] == 2:
+            # The messages hash lost entries (evicted on its own): store it whole.
+            result = self._guard.call("write", lambda: write(frozenset()), None)
+        if result is None:
+            return
+        written, token = result
         if written == 1:
             tracker.shared_token, tracker.shared_digests = token, frozenset(digests)
+            self._prune(msgs_key, set(digests))
         elif written == 0:
             # Two replicas ran turns of one session at once, which the caller's
             # contract excludes; the next turn takes the state that won.
             logger.warning("compress sessions: another replica wrote %s first", meta_key)
 
+    def _prune(self, msgs_key: str, referenced: set[str]) -> None:
+        """Drop messages no transcript references (moved markers, edits,
+        compactions) once they outnumber the referenced ones."""
+        size = self._guard.call("write", lambda: int(self._client.hlen(msgs_key)), 0)
+        if size <= 2 * len(referenced):
+            return
+
+        def prune() -> None:
+            stale = [k for k in map(_text, self._client.hkeys(msgs_key)) if k not in referenced]
+            for start in range(0, len(stale), _CHUNK):
+                self._client.hdel(msgs_key, *stale[start : start + _CHUNK])
+
+        self._guard.call("write", prune, None)
+
     def _keys(self, key: str) -> tuple[str, str]:
-        # One hash tag, so both keys sit in one Redis Cluster slot.
+        # One hash tag: the compare-and-set script names both keys, which Redis
+        # Cluster allows only within one slot.
         base = f"{self._prefix}{{{hashlib.blake2b(key.encode(), digest_size=16).hexdigest()}}}"
         return f"{base}:meta", f"{base}:msgs"
 

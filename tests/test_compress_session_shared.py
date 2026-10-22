@@ -191,3 +191,56 @@ def test_a_store_url_that_is_not_redis_stops_startup(monkeypatch):
     monkeypatch.setenv(shared_sessions.STORE_ENV, "memcached://cache:11211")
     with pytest.raises(ConfigurationError, match="redis://"):
         shared_sessions.open_shared_sessions()
+
+
+def _meta_key(redis_server):
+    (meta_key,) = redis_server.keys("headroom:session:*:meta")
+    return meta_key
+
+
+def test_messages_evicted_on_their_own_are_stored_whole_again(redis_server):
+    history = _big_tool_history()
+    with _replica() as a, _replica() as b:
+        _compress(a, history, session_id="conv-evict")
+        meta_key = _meta_key(redis_server)
+        redis_server.delete(meta_key.replace(b":meta", b":msgs"))  # maxmemory took one key
+        history2 = history + [{"role": "user", "content": "y"}]
+        turn2 = _compress(a, history2, session_id="conv-evict")
+        turn3 = _compress(b, history2 + [{"role": "user", "content": "z"}], session_id="conv-evict")
+        assert turn3["session"]["frozen_message_count"] >= len(turn2["messages"])
+
+
+def test_corrupt_state_is_rewritten_by_the_next_replica_to_write(redis_server):
+    history = _big_tool_history()
+    with _replica() as a, _replica() as b, _replica() as c:
+        _compress(a, history, session_id="conv-corrupt")
+        redis_server.hset(_meta_key(redis_server), "m", "{not json")
+        history2 = history + [{"role": "user", "content": "y"}]
+        turn2 = _compress(b, history2, session_id="conv-corrupt")  # repairs it
+        turn3 = _compress(
+            c, history2 + [{"role": "user", "content": "z"}], session_id="conv-corrupt"
+        )
+        assert turn3["messages"][: len(turn2["messages"])] == turn2["messages"]
+        assert turn3["session"]["frozen_message_count"] >= len(turn2["messages"])
+
+
+def test_messages_no_transcript_references_are_pruned(redis_server):
+    history = _big_tool_history()
+    with _replica() as a:
+        _compress(a, history, session_id="conv-prune")
+        msgs_key = _meta_key(redis_server).replace(b":meta", b":msgs")
+        redis_server.hset(msgs_key, mapping={f"stale{i}": "{}" for i in range(50)})
+        _compress(a, history + [{"role": "user", "content": "y"}], session_id="conv-prune")
+        assert not any(k.startswith(b"stale") for k in redis_server.hkeys(msgs_key))
+
+
+def test_a_writer_whose_clock_runs_ahead_is_still_trusted(redis_server):
+    history = _big_tool_history()
+    with _replica() as a, _replica() as b:
+        turn1 = _compress(a, history, session_id="conv-skew")
+        meta_key = _meta_key(redis_server)
+        meta = json.loads(redis_server.hget(meta_key, "m"))
+        meta["last_activity"] += 30  # A's clock is 30 s ahead of B's
+        redis_server.hset(meta_key, "m", json.dumps(meta))
+        turn2 = _compress(b, history + [{"role": "user", "content": "y"}], session_id="conv-skew")
+        assert turn2["session"]["frozen_message_count"] >= len(turn1["messages"])
