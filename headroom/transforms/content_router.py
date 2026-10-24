@@ -3691,8 +3691,15 @@ class ContentRouter(Transform):
         # Count with the router's OWN estimator, not the compressor's self-report.
         compressed_tokens = _estimate_tokens(compressed)
         # Persist the hash -> original recovery map the SAME way SmartCrusher
-        # mirrors its markers, so a later /v1/retrieve resolves each hash.
-        self._persist_external_recoverable(out.recoverable, name, context)
+        # mirrors its markers, so a later /v1/retrieve resolves each hash. A
+        # hash the store did not take points nowhere: fall back instead.
+        if not self._persist_external_recoverable(out.recoverable, name, context):
+            logger.warning(
+                "external compressor %r: CCR store did not keep its originals; "
+                "falling back to built-in",
+                name,
+            )
+            return None
         if out.warnings:
             logger.debug(
                 "external compressor %r warnings: %s", name, "; ".join(map(str, out.warnings))
@@ -3705,29 +3712,33 @@ class ContentRouter(Transform):
 
     def _persist_external_recoverable(
         self, recoverable: dict[str, str], name: str, context: str
-    ) -> None:
+    ) -> bool:
         """Mirror an external compressor's hash -> original map into the CCR store.
 
         Mirrors SmartCrusher's ``_mirror_single_hash_to_python_store``: each
         entry is stored under its own hash via ``explicit_hash`` so a
-        ``/v1/retrieve/{hash}`` lookup returns the original. Best-effort — a
-        store failure or a non-hex hash is logged and never breaks the request
-        (the compressed block is still returned; only that entry is unretrievable).
+        ``/v1/retrieve/{hash}`` lookup returns the original. Returns whether
+        every entry was stored (True without a store module, as SmartCrusher):
+        on False the caller discards the compressed block, whose markers would
+        point nowhere. Failures are logged and never break the request.
         """
         if not recoverable:
-            return
+            return True
         try:
             from ..cache.compression_store import get_compression_store
-
-            store = get_compression_store()
-        except Exception as exc:  # noqa: BLE001 - CCR store optional/stripped builds
+        except ImportError as exc:  # stripped builds ship no CCR store
             logger.debug("external compressor %r: CCR store unavailable (%s)", name, exc)
-            return
+            return True
+        try:
+            store = get_compression_store()
+        except Exception as exc:  # noqa: BLE001 - never break the request
+            logger.debug("external compressor %r: CCR store unavailable (%s)", name, exc)
+            return False
         strategy_label = f"external:{name}"
         for ccr_hash, original in recoverable.items():
             if not isinstance(ccr_hash, str) or not isinstance(original, str):
-                logger.debug("external compressor %r: skipping non-str recoverable entry", name)
-                continue
+                logger.debug("external compressor %r: non-str recoverable entry", name)
+                return False
             try:
                 store.store(
                     original=original,
@@ -3747,8 +3758,11 @@ class ContentRouter(Transform):
                     name,
                     ccr_hash,
                 )
+                return False
             except Exception as exc:  # noqa: BLE001 - defensive; never break the request
                 logger.debug("external compressor %r: store.store raised (%s)", name, exc)
+                return False
+        return True
 
     def _registry_compress(
         self,

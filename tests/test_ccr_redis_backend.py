@@ -333,3 +333,77 @@ def test_mcp_read_returns_the_file_and_caches_no_hash_while_redis_is_down(flaky_
     asyncio.run(server._handle_read({"file_path": str(path)}))
     (_, ccr_hash, _, _) = next(iter(server._file_cache.values()))
     assert store.retrieve(ccr_hash).original_content == path.read_text(encoding="utf-8")
+
+
+def _router(**config):
+    from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
+
+    return ContentRouter(ContentRouterConfig(enable_kompress=False, **config))
+
+
+@pytest.mark.parametrize("outage", ["oom", "down"])
+def test_smart_crusher_row_drop_keeps_the_rows_while_redis_fails_then_resumes(
+    flaky_store, outage, monkeypatch
+):
+    pytest.importorskip("headroom._core")
+    import re
+
+    monkeypatch.setenv("HEADROOM_DETECT_BACKEND", "python")
+    store, client = flaky_store
+    rows = [{"id": i, "status": "ok", "tag": "alpha"} for i in range(60)]
+    router = _router(smart_crusher_with_compaction=False)  # the row-drop path
+    client.outage = outage
+    assert "<<ccr:" not in router.compress(json.dumps(rows)).compressed
+
+    client.outage = None
+    resumed = router.compress(json.dumps(rows)).compressed
+    entry = store.retrieve(re.search(r"<<ccr:([0-9a-f]+)", resumed).group(1))
+    assert entry is not None and json.loads(entry.original_content) == rows
+
+
+@pytest.mark.parametrize("outage", ["oom", "down"])
+def test_external_compressor_output_is_dropped_while_redis_fails_then_resumes(
+    flaky_store, outage, monkeypatch
+):
+    import hashlib
+
+    from headroom.transforms.compressor_registry import CompressorDescriptor, CompressOutput
+
+    monkeypatch.setenv("HEADROOM_DETECT_BACKEND", "python")
+    store, client = flaky_store
+
+    class External:
+        descriptor = CompressorDescriptor(
+            name="ext_json",
+            content_types=["application/json"],
+            lossless=False,
+            cost_tier="fast",
+            recoverable=True,
+        )
+
+        def compress(self, inp):
+            digest = hashlib.sha256(inp.content.encode()).hexdigest()[:24]
+            return CompressOutput(
+                content=f"[external <<ccr:{digest}>>]",
+                tokens_before=len(inp.content.split()),
+                tokens_after=2,
+                lossless=False,
+                markers=[],
+                recoverable={digest: inp.content},
+                warnings=[],
+            )
+
+    content = json.dumps([{"id": i, "note": f"descriptive field {i} " * 3} for i in range(40)])
+    router = _router(active_external_compressors=["ext_json"])
+    router.compressor_registry.register(External(), replace=True)
+    router._active_external_compressors = router._resolve_active_external_compressors()
+    client.outage = outage
+    failed = router.compress(content)
+    assert "external:ext_json" not in failed.strategy_chain
+    assert "<<ccr:" not in failed.compressed
+
+    client.outage = None
+    resumed = router.compress(content)
+    assert "external:ext_json" in resumed.strategy_chain
+    digest = hashlib.sha256(content.encode()).hexdigest()[:24]
+    assert store.retrieve(digest).original_content == content
