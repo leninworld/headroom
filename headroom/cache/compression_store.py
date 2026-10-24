@@ -43,6 +43,7 @@ from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
+from ..exceptions import StorageError
 from ..log_safety import describe_exception, safe_id
 
 if TYPE_CHECKING:
@@ -337,6 +338,11 @@ class CompressionStore:
 
         Returns:
             Hash key for retrieving this content.
+
+        Raises:
+            StorageError: The backend did not keep the entry (a shared store
+                refused the write or was unreachable). No hash is issued for
+                it: the caller must keep the original rather than emit a marker.
         """
         # Generate hash from original content. Default: SHA-256[:24] of the
         # original. When the caller provides `explicit_hash`, use it
@@ -454,9 +460,15 @@ class CompressionStore:
                 # Mark old heap entry as stale since we're replacing it.
                 self._mark_heap_entries_stale()
 
-            written = self._backend.set(hash_key, entry)
+            if self._backend.set(hash_key, entry) is False:
+                # Only a backend that absorbs its errors (Redis) returns False;
+                # it has logged why. A hash here would be a marker that never
+                # resolves, and producers drop the original once they hold one.
+                raise StorageError(
+                    f"CCR store did not keep hash={hash_key}; keep the original content"
+                )
             if self._backend_expires_entries:
-                if existing is None and written is not False:
+                if existing is None:
                     self._own_totals[0] += entry.original_tokens
                     self._own_totals[1] += entry.compressed_tokens
                 return hash_key  # no local index: Redis expires it

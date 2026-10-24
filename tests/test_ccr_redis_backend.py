@@ -6,6 +6,8 @@ Behind a gateway that spreads requests across replicas, the retrieval of a
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 fakeredis = pytest.importorskip("fakeredis")
@@ -15,6 +17,7 @@ from headroom.cache.compression_store import (  # noqa: E402
     CompressionStore,
     _create_default_ccr_backend,
 )
+from headroom.exceptions import StorageError  # noqa: E402
 
 
 @pytest.fixture
@@ -46,7 +49,7 @@ def test_deployments_with_different_prefixes_do_not_share(server, monkeypatch):
     assert _replica(server).retrieve(hash_key) is None
 
 
-def test_redis_down_is_a_miss_and_never_fails_compression(monkeypatch):
+def test_redis_down_is_a_miss_and_issues_no_hash(monkeypatch):
     import redis
 
     class Down(fakeredis.FakeRedis):
@@ -54,8 +57,9 @@ def test_redis_down_is_a_miss_and_never_fails_compression(monkeypatch):
             raise redis.ConnectionError("connection refused")
 
     store = CompressionStore(backend=RedisBackend("redis://localhost", client=Down()))
-    hash_key = store.store("original " * 40, "short")  # no raise
-    assert store.retrieve(hash_key) is None
+    with pytest.raises(StorageError):
+        store.store("original " * 40, "short")
+    assert store.retrieve("abc123def456") is None
 
 
 def test_a_corrupt_entry_is_a_miss(server):
@@ -116,7 +120,8 @@ def test_a_redis_that_reads_but_refuses_writes_logs_once(caplog):
     store = CompressionStore(backend=RedisBackend("redis://localhost", client=Full()))
     with caplog.at_level("INFO", logger="headroom.cache.redis_client"):
         for i in range(5):
-            store.store(f"original {i} " * 40, "short")
+            with pytest.raises(StorageError):
+                store.store(f"original {i} " * 40, "short")
             store.retrieve("abc123def456")
     messages = [r.getMessage() for r in caplog.records]
     assert sum("failed" in m for m in messages) == 1
@@ -169,6 +174,162 @@ def test_a_write_redis_refuses_adds_no_tokens(caplog):
             raise redis.ResponseError("OOM command not allowed")
 
     store = CompressionStore(backend=RedisBackend("redis://localhost", client=Full()))
-    store.store("original " * 40, "short", original_tokens=80, compressed_tokens=2)
+    with pytest.raises(StorageError):
+        store.store("original " * 40, "short", original_tokens=80, compressed_tokens=2)
     stats = store.get_stats()
     assert (stats["total_original_tokens"], stats["totals_scope"]) == (0, "this_replica")
+
+
+# --- A producer never advertises an original Redis did not take -------------
+
+_CONFIG = "[server]\n" + "".join(
+    f"# comment line {i} describing port_{i}\nport_{i} = {8000 + i}\n" for i in range(30)
+)
+
+
+class _Flaky(fakeredis.FakeRedis):
+    """A Redis that refuses writes (``oom``) or cannot be reached (``down``)."""
+
+    outage: str | None = None
+
+    def execute_command(self, *args, **kwargs):
+        import redis
+
+        if self.outage == "down":
+            raise redis.ConnectionError("connection refused")
+        if self.outage == "oom" and args[0] == "SET":
+            raise redis.ResponseError("OOM command not allowed")
+        return super().execute_command(*args, **kwargs)
+
+
+@pytest.fixture
+def flaky_store(server, monkeypatch):
+    from headroom.cache import compression_store, redis_client
+
+    monkeypatch.setattr(redis_client, "BACKOFF_SECONDS", 0.0)  # recovery is immediate
+    client = _Flaky(server=server)
+    store = CompressionStore(backend=RedisBackend("redis://localhost", client=client))
+    compression_store.set_request_compression_store(store)
+    yield store, client
+    compression_store.clear_request_compression_store()
+
+
+def _marker_hash(text: str) -> str | None:
+    import re
+
+    found = re.search(r"hash=([0-9a-f]{24})", text)
+    return found.group(1) if found else None
+
+
+@pytest.mark.parametrize("outage", ["oom", "down"])
+def test_config_elision_keeps_the_original_while_redis_fails_then_resumes(flaky_store, outage):
+    from headroom.transforms.config_compressor import ConfigCompressor
+
+    store, client = flaky_store
+    client.outage = outage
+    failed = ConfigCompressor().compress(_CONFIG)
+    assert failed.compressed == _CONFIG and failed.ccr_hash is None and failed.lines_elided == 0
+
+    client.outage = None
+    resumed = ConfigCompressor().compress(_CONFIG)
+    assert resumed.lines_elided == 30
+    entry = store.retrieve(_marker_hash(resumed.compressed))
+    assert entry is not None and entry.original_content == _CONFIG
+
+
+@pytest.mark.parametrize("outage", ["oom", "down"])
+def test_read_maturation_keeps_the_read_while_redis_fails_then_resumes(flaky_store, outage):
+    from headroom.config import ReadMaturationConfig
+    from headroom.transforms.read_maturation import ReadMaturationManager
+
+    store, client = flaky_store
+    content = "     1\tdef foo():\n     2\t    return 42\n" * 60
+    messages = [
+        {"role": "user", "content": "look"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": "r1", "name": "Read", "input": {"file_path": "/x.py"}}
+            ],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "r1", "content": content}],
+        },
+        *[{"role": "assistant", "content": [{"type": "text", "text": "t"}]} for _ in range(5)],
+    ]
+    manager = ReadMaturationManager(
+        ReadMaturationConfig(enabled=True, quiesce_turns=5), compression_store=store
+    )
+    client.outage = outage
+    assert manager.apply(messages).messages[2]["content"][0]["content"] == content
+
+    client.outage = None
+    matured = manager.apply(messages).messages[2]["content"][0]["content"]
+    entry = store.retrieve(_marker_hash(matured))
+    assert entry is not None and entry.original_content == content
+
+
+@pytest.mark.parametrize("outage", ["oom", "down"])
+def test_read_lifecycle_keeps_a_stale_read_while_redis_fails(flaky_store, outage):
+    from headroom.config import ReadLifecycleConfig
+    from headroom.transforms.read_lifecycle import ReadLifecycleManager
+
+    store, client = flaky_store
+    content = "x = 1\n" * 200
+
+    def call(tc_id, name, args):
+        fn = {"name": name, "arguments": json.dumps(args)}
+        return {"role": "assistant", "content": None, "tool_calls": [{"id": tc_id, "function": fn}]}
+
+    messages = [
+        call("r1", "Read", {"file_path": "/a.py"}),
+        {"role": "tool", "tool_call_id": "r1", "content": content},
+        call("e1", "Edit", {"file_path": "/a.py", "old_string": "x", "new_string": "y"}),
+        {"role": "tool", "tool_call_id": "e1", "content": "ok"},
+    ]
+    manager = ReadLifecycleManager(ReadLifecycleConfig(enabled=True), compression_store=store)
+    client.outage = outage
+    assert manager.apply(messages).messages[1]["content"] == content
+
+    client.outage = None
+    entry = store.retrieve(_marker_hash(manager.apply(messages).messages[1]["content"]))
+    assert entry is not None and entry.original_content == content
+
+
+@pytest.mark.parametrize("outage", ["oom", "down"])
+def test_rust_log_compression_keeps_the_log_while_redis_fails(flaky_store, outage):
+    pytest.importorskip("headroom._core")
+    from headroom.transforms.log_compressor import LogCompressor, LogCompressorConfig
+
+    store, client = flaky_store
+    log = "\n".join(["npm WARN deprecated x"] * 30 + ["npm ERR! something broke"] * 5)
+    compressor = LogCompressor(LogCompressorConfig(enable_ccr=True, min_lines_for_ccr=3))
+    client.outage = outage
+    failed = compressor.compress(log)
+    assert failed.compressed == log and failed.cache_key is None
+
+    client.outage = None
+    resumed = compressor.compress(log)
+    assert resumed.cache_key is not None
+    assert store.retrieve(resumed.cache_key).original_content == log
+
+
+def test_mcp_read_returns_the_file_and_caches_no_hash_while_redis_is_down(flaky_store, tmp_path):
+    import asyncio
+
+    from tests._mcp_stub import import_module_with_mcp_stub
+
+    mcp_server = import_module_with_mcp_stub("headroom.ccr.mcp_server")
+    store, client = flaky_store
+    path = tmp_path / "a.py"
+    path.write_text("x = 1\n" * 50, encoding="utf-8")
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+    client.outage = "down"
+    response = asyncio.run(server._handle_read({"file_path": str(path)}))
+    assert "x = 1" in response[0].kwargs["text"] and not server._file_cache
+
+    client.outage = None
+    asyncio.run(server._handle_read({"file_path": str(path)}))
+    (_, ccr_hash, _, _) = next(iter(server._file_cache.values()))
+    assert store.retrieve(ccr_hash).original_content == path.read_text(encoding="utf-8")

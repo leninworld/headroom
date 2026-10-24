@@ -57,7 +57,8 @@ class CompressionStoreBackend(Protocol):
             entry: The CompressionEntry to store.
 
         Returns:
-            ``False`` when a backend that absorbs its errors did not store it;
+            ``False`` when a backend that absorbs its errors did not store it
+            (``CompressionStore.store`` then raises ``StorageError``);
             ``None`` (or ``True``) otherwise.
 
         Note:
