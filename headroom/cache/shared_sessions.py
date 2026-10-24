@@ -22,8 +22,9 @@ replica has written since, it reads the metadata and only the messages it does
 not already hold, and the turn seeds its compression cache from that tracker as
 after a restart (:func:`~headroom.cache.prefix_tracker.seed_restored_compression_cache`).
 After the turn it writes the new messages, then the metadata if the token is
-still the one it read (compare-and-set): a random token, so a lost key or a
-failover cannot leave a replica believing stale state is current. A missing key
+still the one it read and every message it references is stored, checked in
+one script (compare-and-set): a random token, so a lost key or a failover
+cannot leave a replica believing stale state is current. A missing key
 resets the replica, whose next write stores the session whole again. Fetched
 messages are checked against their digests. Both keys expire with the tracker.
 
@@ -57,9 +58,10 @@ _CHUNK = 256
 
 # Install ARGV[2] as the token and ARGV[3] as the metadata if the token is still
 # ARGV[1] ("" when the key must not exist) and the messages hash (KEYS[2]) holds
-# every message the metadata references (ARGV[5:], the ones this write did not
-# send). 1 on success, 0 when another replica wrote first, 2 when the messages
-# hash lost one.
+# every message the metadata references (ARGV[5:], including those this write
+# just sent: Redis can evict the hash between those writes and this script).
+# 1 on success, 0 when another replica wrote first, 2 when the messages hash
+# lost one.
 _CAS = """
 local t = redis.call('HGET', KEYS[1], 't') or ''
 if t ~= ARGV[1] then return 0 end
@@ -180,17 +182,17 @@ class SharedSessions:
         meta_json = json.dumps(meta)
         ttl_ms = max(1000, int(tracker.retention_seconds() * 1000))
         meta_key, msgs_key = self._keys(key)
+        referenced = sorted(set(digests))
 
         def write(known: frozenset[str]) -> tuple[int, str]:
             new = [(d, m) for d, m in zip(digests, table, strict=True) if d not in known]
-            assumed = sorted(set(digests) & known)  # stored by an earlier write
             token = uuid.uuid4().hex
             pipe = self._client.pipeline(transaction=False)
             for start in range(0, len(new), _CHUNK):
                 pipe.hset(msgs_key, mapping=dict(new[start : start + _CHUNK]))
             pipe.pexpire(msgs_key, ttl_ms)
             pipe.execute()
-            args = [tracker.shared_token, token, meta_json, ttl_ms, *assumed]
+            args = [tracker.shared_token, token, meta_json, ttl_ms, *referenced]
             return int(self._cas(keys=[meta_key, msgs_key], args=args)), token
 
         result = self._guard.call("write", lambda: write(tracker.shared_digests), None)
@@ -203,6 +205,10 @@ class SharedSessions:
         if written == 1:
             tracker.shared_token, tracker.shared_digests = token, frozenset(digests)
             self._prune(msgs_key, set(digests))
+        elif written == 2:
+            # Evicted again during the whole rewrite: publish nothing, so no
+            # replica takes a session it cannot replay; the next turn retries.
+            logger.warning("compress sessions: messages of %s evicted while writing", meta_key)
         elif written == 0:
             # Two replicas ran turns of one session at once, which the caller's
             # contract excludes; the next turn takes the state that won.

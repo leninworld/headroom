@@ -271,3 +271,72 @@ def test_a_corrupt_token_never_fails_a_turn_and_is_replaced(redis_server):
         turn2 = _compress(b, history2, session_id="conv-token")
         turn3 = _compress(a, history2 + [{"role": "user", "content": "z"}], session_id="conv-token")
         assert turn3["session"]["frozen_message_count"] >= len(turn2["messages"])
+
+
+@pytest.fixture
+def evict_before_cas(monkeypatch):
+    """Delete the messages hash just before the next ``times`` compare-and-set
+    scripts run, as maxmemory might between the message writes and the script."""
+    budget = {"times": 0}
+    real_init = shared_sessions.SharedSessions.__init__
+
+    def init(self, client):
+        real_init(self, client)
+        cas = self._cas
+
+        def evicting_cas(keys, args):
+            if budget["times"]:
+                budget["times"] -= 1
+                client.delete(keys[1])
+            return cas(keys=keys, args=args)
+
+        self._cas = evicting_cas
+
+    monkeypatch.setattr(shared_sessions.SharedSessions, "__init__", init)
+    return budget
+
+
+def test_eviction_before_the_first_publish_is_never_acknowledged(redis_server, evict_before_cas):
+    history = _big_tool_history()
+    with _replica() as a, _replica() as b:
+        evict_before_cas["times"] = 1
+        turn1 = _compress(a, history, session_id="conv-evict-first")
+        turn2 = _compress(
+            b, history + [{"role": "user", "content": "y"}], session_id="conv-evict-first"
+        )
+        assert turn2["messages"][: len(turn1["messages"])] == turn1["messages"]
+        assert turn2["session"]["frozen_message_count"] >= len(turn1["messages"])
+
+
+@pytest.mark.parametrize("corrupt", [False, True], ids=["delta", "whole-rewrite"])
+def test_eviction_before_a_later_publish_is_never_acknowledged(
+    redis_server, evict_before_cas, corrupt
+):
+    history = _big_tool_history()
+    with _replica() as a, _replica() as b, _replica() as c:
+        _compress(a, history, session_id="conv-evict-later")
+        if corrupt:  # B then rewrites the session whole, assuming no message stored
+            redis_server.hset(_meta_key(redis_server), "m", "{not json")
+        history2 = history + [{"role": "user", "content": "y"}]
+        evict_before_cas["times"] = 1
+        turn2 = _compress(b, history2, session_id="conv-evict-later")
+        turn3 = _compress(
+            c, history2 + [{"role": "user", "content": "z"}], session_id="conv-evict-later"
+        )
+        assert turn3["messages"][: len(turn2["messages"])] == turn2["messages"]
+        assert turn3["session"]["frozen_message_count"] >= len(turn2["messages"])
+
+
+def test_a_session_whose_messages_keep_vanishing_is_not_published(redis_server, evict_before_cas):
+    history = _big_tool_history()
+    with _replica() as a, _replica() as b:
+        evict_before_cas["times"] = 2  # the write and its whole rewrite
+        _compress(a, history, session_id="conv-evict-twice")
+        assert not redis_server.keys("headroom:session:*:meta")
+        # Once Redis keeps the messages again, the next turn publishes it whole.
+        history2 = history + [{"role": "user", "content": "y"}]
+        turn2 = _compress(a, history2, session_id="conv-evict-twice")
+        turn3 = _compress(
+            b, history2 + [{"role": "user", "content": "z"}], session_id="conv-evict-twice"
+        )
+        assert turn3["session"]["frozen_message_count"] >= len(turn2["messages"])
