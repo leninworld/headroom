@@ -197,3 +197,31 @@ def test_a_cache_without_a_namespace_clears_only_its_own_rows(tmp_path):
     other.put("b", "result b", 0.5, "text")
     mine.clear()
     assert store.get("router-b:b") is not None
+
+
+def test_a_disk_read_in_flight_never_replaces_a_newer_put(tmp_path):
+    store = ResultStore(tmp_path / "c.db", 1800)
+    cache = CompressionCache(max_bytes=600, store=store)
+    cache.put("k", "old", 0.5, "text")
+    cache.put("other", "z" * 300, 0.5, "text")  # evicts k from memory
+    read_done, release = threading.Event(), threading.Event()
+    real_get = store.get
+
+    def paused_get(key):
+        found = real_get(key)
+        store.get = real_get  # pause only the first read
+        read_done.set()
+        assert release.wait(5)
+        return found
+
+    store.get = paused_get
+    results = []
+    reader = threading.Thread(target=lambda: results.append(cache.get("k")))
+    reader.start()
+    assert read_done.wait(5)  # the read has "old" in hand
+    cache.put("k", "new", 0.5, "text")
+    release.set()
+    reader.join(5)
+    assert results == [("new", 0.5, "text")]
+    assert cache.get("k") == ("new", 0.5, "text")
+    assert store.get(cache._namespace + "k")[0] == "new"

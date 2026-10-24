@@ -1683,8 +1683,10 @@ class CompressionCache:
         self._store = store
         # A namespace of its own, so clear() never reaches other caches' rows.
         self._namespace = namespace or ("cache:" if store is not None else "")
-        # Bumped by clear(), so a disk read racing it is not admitted after it.
-        self._generation = 0
+        # {key: token} for keys a get() is reading from disk. put(),
+        # move_to_skip() and clear() drop the key, so a read that raced one of
+        # them is not admitted over the newer state.
+        self._disk_reads: dict[str, object] = {}
         # Callbacks invoked (outside the lock) whenever ``clear()`` runs, so
         # sibling state keyed by the same content keys (e.g. the router's
         # frozen-verdict store) can be reset in lock-step with the cache.
@@ -1746,13 +1748,24 @@ class CompressionCache:
                     if touch_disk and self._store is not None:
                         self._store.touch(self._namespace + key)
                     return hit
-            generation = self._generation
-        found = self._store.get(self._namespace + key) if self._store is not None else None
+            if self._store is None:
+                self._misses += 1
+                self._record_lookup(t0)
+                return None
+            token = self._disk_reads[key] = object()
+        found = self._store.get(self._namespace + key)
         with self._lock:
-            if found is not None and generation == self._generation:
-                self._admit_locked(key, *found)
-                self._disk_hits += 1
-            elif found is None:
+            if self._disk_reads.get(key) is token:
+                del self._disk_reads[key]
+                if found is not None:
+                    self._admit_locked(key, *found)
+                    self._disk_hits += 1
+            else:
+                # A write for this key (or a later read of it) landed during
+                # the read; the newest result is the one in memory, if any.
+                newer = self._results.get(key)
+                found = None if newer is None else newer[:3]
+            if found is None:
                 self._misses += 1
             self._record_lookup(t0)
         return found
@@ -1772,6 +1785,7 @@ class CompressionCache:
     def put(self, key: str, compressed: str, ratio: float, strategy: str) -> None:
         """Store a compressed result (Tier 2).  Thread-safe."""
         with self._lock:
+            self._disk_reads.pop(key, None)
             has_marker = self._admit_locked(key, compressed, ratio, strategy)
         if self._store is None:
             return
@@ -1796,6 +1810,7 @@ class CompressionCache:
         """Move a result to skip set (threshold tightened, no longer qualifies).
         Thread-safe."""
         with self._lock:
+            self._disk_reads.pop(key, None)
             self._drop_locked(key)
             self._skip_locked(key)
         if self._store is not None:
@@ -1874,7 +1889,7 @@ class CompressionCache:
             self._results.clear()
             self._bytes = 0
             self._skip.clear()
-            self._generation += 1
+            self._disk_reads.clear()
         if self._store is not None:
             self._store.clear_prefix(self._namespace)
         # Fire callbacks outside the lock to avoid cross-lock ordering issues.
