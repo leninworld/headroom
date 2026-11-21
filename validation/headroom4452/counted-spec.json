@@ -1,0 +1,56 @@
+{
+  "schema": "headroom4452-hosted-a28b/1",
+  "attempt": "28 of 55",
+  "attempts_consumed_before": 27,
+  "branch": "validate-headroom4452-7e5efedc-a28",
+  "repository": "leninworld/headroom",
+  "pr": 4452,
+  "pr_head": "c79ba62c19b63f921d52aa7f507c2fe06c16756a",
+  "pr_head_tree": "accb00de7f1e584c1a5794b59b08a9b135519855",
+  "candidate": "7e5efedc143f11773263c266476da83c70712ed2",
+  "candidate_tree": "acf20af4187cfa5cd93ac174f188d03c5497be96",
+  "candidate_patch_sha256": "5825a0a6bbaef784d2337f8638b8c07ddc7028f5a96f611a957989aa97d9b6fe",
+  "candidate_files": {
+    "headroom/memory/bridge.py": "af84fe900f3b734ed348dd6a0636a3e649d4ecc205674d329cc228bd996a8918",
+    "tests/test_memory_bridge.py": "7efadefd0c93b2d0be40af8cbadd73c59d1042e04df6c627c4f6ea09fb6e87ef"
+  },
+  "base_files": {
+    "headroom/memory/bridge.py": "3b6805a01a1c718081dca3bed1e25b641f5466c1f8a52282abcb1c6c448e8c21",
+    "tests/test_memory_bridge.py": "18ae2c9dc7cfa866d2dae13d510834833684e2795f53488b56783eb6762c7897"
+  },
+  "merge_main": "e27f0d96cc3032d5f2c510ac97545553b867a697",
+  "merge_tree": "ad6c834507a6921a705ab89f505c4cc72b49499e",
+  "container_image": "ghcr.io/astral-sh/uv:python3.12-bookworm@sha256:85d4cb1afa769a7338e095b927bee941cf5ec92266c7424b3f6c0f2748567248",
+  "rust_image": "rust:1.95.0-slim-bookworm@sha256:d7482085ff5b415f84dba5647ae71606650bdef00db7aeb69f4b3d170c3e4082",
+  "rust": "1.95.0",
+  "pip": "25.0.1",
+  "maturin": "1.16.0",
+  "build_backend": "maturin",
+  "build_system_requires": ["maturin>=1.5,<2.0"],
+  "wheelhouse_pins": ["maturin==1.16.0"],
+  "commitlint": "19.8.1",
+  "commitlint_config_blob": "e0644229ddf2cb26f357e2bab96160713180536b",
+  "commitlint_config_sha256": "9c01039796725ebf6bcfc559274baf3fb98910edfaa073c3a5db7f5b9995a7e2",
+  "commitlint_from": "18067b1d19f6606bae3b4d6b50efeeaa48dc477e",
+  "commitlint_to": "c79ba62c19b63f921d52aa7f507c2fe06c16756a",
+  "ruff": "0.17.4",
+  "mypy": "1.20.2",
+  "ci_python": "3.12",
+  "langchain_core": "langchain-core>=1.3.3,<4.0",
+  "model": {
+    "repo": "sentence-transformers/all-MiniLM-L6-v2",
+    "revision": "c9745ed1d9f207416be6d2e6f8de32d1f16199bf"
+  },
+  "tiktoken_encodings": ["cl100k_base", "o200k_base", "p50k_base", "r50k_base"],
+  "whole_file_identity_count": 62,
+  "whole_file_identity_sha256": "496f9bf3271c421eb5615475d41422a0846e40b5eafcc19b9b5eee83a136153e",
+  "allowed_new_files_after_build": [
+    "headroom/_core.abi3.so",
+    "headroom_memory.db",
+    "headroom_memory_vectors.db"
+  ],
+  "lanes": ["source-gates", "python-proof", "rust-workspace", "ci-python-commitlint"],
+  "job_timeout_minutes": 60,
+  "network_policy": "Dependency, model and tokenizer acquisition only during image preparation. Every validation command runs in a fresh --network none container with no secrets or credentials mounted.",
+  "no_cross_clock_arithmetic": true
+}

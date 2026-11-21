@@ -1,0 +1,37 @@
+[
+  {
+    "bytes": 2090,
+    "git_blob": "4e6e9e5a15316b2855a3f7d373fe7cd7789a5469",
+    "mode": "100644",
+    "path": ".github/workflows/validate-headroom4452-a28.yml",
+    "sha256": "8158da9b43e379e55005201e58be4cdc6401b02379f3135c1af78f816ce7eae7"
+  },
+  {
+    "bytes": 10603,
+    "git_blob": "1fb5193e0a653fb0e1c71fe72f046460041ab915",
+    "mode": "100644",
+    "path": "validation/headroom4452/candidate.patch",
+    "sha256": "5825a0a6bbaef784d2337f8638b8c07ddc7028f5a96f611a957989aa97d9b6fe"
+  },
+  {
+    "bytes": 1191,
+    "git_blob": "30419152b66c5a3604141f689efb7862c35387fa",
+    "mode": "100644",
+    "path": "validation/headroom4452/docker_run.py",
+    "sha256": "888787979b1404f17fdd7d1f0857ef91e17f4fc75923d2d3ef45a66dcd897925"
+  },
+  {
+    "bytes": 49455,
+    "git_blob": "8be56c79939bc26f9f1467ac9961cb6be97454c8",
+    "mode": "100644",
+    "path": "validation/headroom4452/hosted.py",
+    "sha256": "e70ea600afe0981ace04500b95e341738cddce5025f462776f02bf6f9e4a0827"
+  },
+  {
+    "bytes": 2832,
+    "git_blob": "5055b49a87b14968a77b15657199f4444cbbdc49",
+    "mode": "100644",
+    "path": "validation/headroom4452/spec.json",
+    "sha256": "5cf47017bc3ac688ded4d2e036919bde495148d620c9b96bc423afd5adc07735"
+  }
+]
