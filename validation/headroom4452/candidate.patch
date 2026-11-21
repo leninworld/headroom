@@ -1,0 +1,254 @@
+diff --git a/headroom/memory/bridge.py b/headroom/memory/bridge.py
+index 5179745..e39b70b 100644
+--- a/headroom/memory/bridge.py
++++ b/headroom/memory/bridge.py
+@@ -30,6 +30,7 @@ from __future__ import annotations
+ 
+ import json
+ import logging
++import re
+ from collections import defaultdict
+ from dataclasses import dataclass, field
+ from datetime import datetime, timezone
+@@ -50,6 +51,52 @@ if TYPE_CHECKING:
+ 
+ logger = logging.getLogger(__name__)
+ 
++# Same heading rule as the bridge parsers, so exported bullets re-import under their topic.
++_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$")
++
++
++def _merge_bullets_into_markdown(
++    existing_content: str, bullets_by_topic: dict[str, list[str]]
++) -> str:
++    """Insert each topic's bullets into its existing section, appending missing sections.
++
++    A topic matches the first heading, of any level, whose text equals the topic. Its
++    bullets go after the heading's own content, before the next heading, so they never
++    land under a later section or a sub-heading.
++    """
++    lines = existing_content.splitlines()
++    headings = [
++        (index, match.group(2).strip())
++        for index, line in enumerate(lines)
++        if (match := _HEADING_RE.match(line))
++    ]
++    inserts: dict[int, list[str]] = defaultdict(list)
++    appended: list[str] = []
++
++    for topic, bullets in bullets_by_topic.items():
++        position = next(
++            (pos for pos, (_, text) in enumerate(headings) if text == topic.strip()), None
++        )
++        if position is None:
++            appended.append(f"\n## {topic}")
++            appended.extend(bullets)
++            continue
++
++        start = headings[position][0] + 1
++        end = headings[position + 1][0] if position + 1 < len(headings) else len(lines)
++        while end > start and not lines[end - 1].strip():
++            end -= 1
++        inserts[end].extend(bullets)
++
++    merged: list[str] = []
++    for index, line in enumerate(lines):
++        merged.extend(inserts.get(index, ()))
++        merged.append(line)
++    merged.extend(inserts.get(len(lines), ()))
++
++    append_text = "\n".join(appended) + "\n" if appended else ""
++    return "\n".join(merged).rstrip() + "\n" + append_text
++
+ 
+ # ---------------------------------------------------------------------------
+ # Stats dataclasses
+@@ -606,8 +653,8 @@ class MemoryBridge:
+     ) -> int:
+         """Append new memories to an existing markdown file.
+ 
+-        Reads the file, appends memories under appropriate sections,
+-        writes back. Returns count of memories appended.
++        Reads the file, inserts memories into their existing sections (appending a
++        section for a topic without one), writes back. Returns count of memories appended.
+         """
+         if not memories:
+             return 0
+@@ -622,29 +669,23 @@ class MemoryBridge:
+ 
+         # Group new memories by topic
+         grouped = self._group_memories_by_topic(memories)
+-        lines_to_append: list[str] = []
++        bullets_by_topic: dict[str, list[str]] = {}
+ 
+         for topic, topic_memories in grouped.items():
+-            # Check if section already exists in the file
+-            section_exists = f"## {topic}" in existing_content
+-
+-            if not section_exists:
+-                lines_to_append.append(f"\n## {topic}")
+-
++            bullets: list[str] = []
+             for memory in topic_memories:
+                 content = memory.content.strip()
+                 first_line = content.split("\n")[0].strip()
+                 if first_line.startswith("- "):
+-                    lines_to_append.append(first_line)
++                    bullets.append(first_line)
+                 else:
+-                    lines_to_append.append(f"- {first_line}")
++                    bullets.append(f"- {first_line}")
++            bullets_by_topic[topic] = bullets
+ 
+-        if not lines_to_append:
++        if not bullets_by_topic:
+             return 0
+ 
+-        # Append to file
+-        append_text = "\n".join(lines_to_append) + "\n"
+-        new_content = existing_content.rstrip() + "\n" + append_text
++        new_content = _merge_bullets_into_markdown(existing_content, bullets_by_topic)
+ 
+         try:
+             path.parent.mkdir(parents=True, exist_ok=True)
+diff --git a/tests/test_memory_bridge.py b/tests/test_memory_bridge.py
+index 3c714a5..79cdf63 100644
+--- a/tests/test_memory_bridge.py
++++ b/tests/test_memory_bridge.py
+@@ -318,6 +318,79 @@ class TestRelationshipExtraction:
+         assert uses_rels[0]["destination"] == long_dst
+ 
+ 
++class TestMarkdownSectionMerge:
++    """Exported bullets join their exact heading's own content (pure function)."""
++
++    @pytest.mark.parametrize(
++        ("existing", "expected"),
++        [
++            pytest.param(
++                "## Facts\n- a\n\n## Updates\n- b\n",
++                "## Facts\n- a\n- new\n\n## Updates\n- b\n",
++                id="heading-above-last-section",
++            ),
++            pytest.param(
++                "## Facts and figures\n- a\n- see ## Facts\n",
++                "## Facts and figures\n- a\n- see ## Facts\n\n## Facts\n- new\n",
++                id="exact-heading-only",
++            ),
++            pytest.param(
++                "## Facts\n- a\n### Details\n- d\n## Updates\n- b\n",
++                "## Facts\n- a\n- new\n### Details\n- d\n## Updates\n- b\n",
++                id="before-sub-heading",
++            ),
++            pytest.param(
++                "## Facts\r\n- a\r\n\r\n## Updates\r\n- b\r\n",
++                "## Facts\n- a\n- new\n\n## Updates\n- b\n",
++                id="crlf",
++            ),
++            pytest.param(
++                "## Facts\n- a\n## Updates\n- b\n## Facts\n- e\n",
++                "## Facts\n- a\n- new\n## Updates\n- b\n## Facts\n- e\n",
++                id="first-duplicate-heading",
++            ),
++            pytest.param("## Facts\n- a", "## Facts\n- a\n- new\n", id="no-trailing-newline"),
++            pytest.param(
++                "## Facts\n- a\n\n\n", "## Facts\n- a\n- new\n", id="trailing-blank-lines"
++            ),
++            pytest.param("## Facts  \n- a\n", "## Facts  \n- a\n- new\n", id="heading-whitespace"),
++            pytest.param(
++                "## Facts\n## Updates\n- b\n",
++                "## Facts\n- new\n## Updates\n- b\n",
++                id="empty-section",
++            ),
++            pytest.param("", "\n\n## Facts\n- new\n", id="empty-file"),
++            pytest.param(
++                "## Updates\n- b\n", "## Updates\n- b\n\n## Facts\n- new\n", id="missing-section"
++            ),
++        ],
++    )
++    def test_merge_places_bullets_in_matching_section(self, existing, expected):
++        from headroom.memory.bridge import _merge_bullets_into_markdown
++
++        assert _merge_bullets_into_markdown(existing, {"Facts": ["- new"]}) == expected
++
++    def test_merge_matches_sub_heading_topic_and_reimports_by_section(self):
++        from headroom.memory.bridge import _merge_bullets_into_markdown
++
++        merged = _merge_bullets_into_markdown(
++            "## Facts\n- a\n### Details\n- d\n\n## Updates\n- b\n",
++            {"Details": ["- detail"], "Facts": ["- fact"], "General": ["- general"]},
++        )
++
++        assert merged == (
++            "## Facts\n- a\n- fact\n### Details\n- d\n- detail\n\n## Updates\n- b\n"
++            "\n## General\n- general\n"
++        )
++        sections = {s.heading: s.facts for s in parse_claude_code_memory(merged).sections}
++        assert sections == {
++            "Facts": ["a", "fact"],
++            "Details": ["d", "detail"],
++            "Updates": ["b"],
++            "General": ["general"],
++        }
++
++
+ # =============================================================================
+ # Bridge Tests (require backend)
+ # =============================================================================
+@@ -597,6 +670,56 @@ class TestMemoryBridgeSync:
+         assert content.count("Release label is cobalt-47") == 1
+         assert content.count("Project uses SQLite") == 1
+ 
++        # A restarted bridge reloads the saved cutoff and file hash, so nothing replays.
++        from headroom.memory.bridge import MemoryBridge
++
++        restarted = MemoryBridge(bridge._config, backend)
++        repeat = await restarted.sync(user_id="test_user")
++
++        assert repeat.import_stats.files_skipped_unchanged == 1
++        assert repeat.import_stats.sections_imported == 0
++        assert repeat.memories_exported == 0
++        assert md_path.read_text(encoding="utf-8") == content
++
++    @pytest.mark.asyncio
++    async def test_sync_inserts_export_into_existing_section_above_last_heading(
++        self, bridge, tmp_dir, backend
++    ):
++        """An exported memory joins its own section, not the file's last heading."""
++        md_path = tmp_dir / "MEMORY.md"
++        md_path.write_text("## Facts\n- User likes Python\n", encoding="utf-8", newline="\n")
++        bridge._config.md_paths = [md_path]
++        initial = await bridge.sync(user_id="test_user")
++        skip_if_offline_bridge_import_failed(initial.import_stats)
++
++        organic = await backend.save_memory(
++            content="Release label is cobalt-47",
++            user_id="test_user",
++            metadata={"topic": "Facts"},
++        )
++        created_at = organic.created_at.replace(tzinfo=timezone.utc)
++        bridge._sync_state["last_sync"] = (created_at - timedelta(minutes=1)).isoformat()
++        bridge._save_sync_state()
++        md_path.write_text(
++            "## Facts\n- User likes Python\n\n## Updates\n- Project uses SQLite\n",
++            encoding="utf-8",
++            newline="\n",
++        )
++
++        with patch("headroom.memory.bridge.datetime", wraps=datetime) as clock:
++            clock.now.return_value = created_at + timedelta(minutes=1)
++            stats = await bridge.sync(user_id="test_user")
++
++        assert stats.memories_exported == 1
++        content = md_path.read_text(encoding="utf-8")
++        assert content == (
++            "## Facts\n- User likes Python\n- Release label is cobalt-47\n\n"
++            "## Updates\n- Project uses SQLite\n"
++        )
++        sections = {s.heading: s.facts for s in parse_markdown(content, str(md_path)).sections}
++        assert sections["Facts"] == ["User likes Python", "Release label is cobalt-47"]
++        assert sections["Updates"] == ["Project uses SQLite"]
++
+     @pytest.mark.asyncio
+     async def test_first_sync_exports_existing_organic_memory(self, bridge, tmp_dir, backend):
+         """An initial import must not hide memories saved before the first sync."""
