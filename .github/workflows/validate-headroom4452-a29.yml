@@ -1,0 +1,62 @@
+name: Headroom 4452 hosted validation attempt 29
+
+on:
+  push:
+    branches:
+      - validate-headroom4452-7e5efedc-a29
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validate-headroom4452-7e5efedc-a29
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: ${{ matrix.lane }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        lane:
+          - source-gates
+          - python-proof
+          - rust-workspace
+          - ci-python-commitlint
+    steps:
+      - name: Record runner disk at job start
+        run: df -h / "$RUNNER_TEMP" | tee "$RUNNER_TEMP/headroom4452-runner-disk-job-start.txt"
+      - name: Checkout diagnostic payload
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: diagnostic
+          persist-credentials: false
+      - name: Checkout frozen PR head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: leninworld/headroom
+          ref: c79ba62c19b63f921d52aa7f507c2fe06c16756a
+          path: src
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Run one bounded hosted-Docker lane
+        env:
+          A29_LANE: ${{ matrix.lane }}
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: >-
+          python3 -I -B diagnostic/validation/headroom4452/hosted.py
+          run --lane "$A29_LANE" --source "$GITHUB_WORKSPACE/src"
+          --patch "$GITHUB_WORKSPACE/diagnostic/validation/headroom4452/candidate.patch"
+          --runner-disk-job-start "$RUNNER_TEMP/headroom4452-runner-disk-job-start.txt"
+          --evidence "$RUNNER_TEMP/headroom4452-$A29_LANE"
+      - name: Upload bounded evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: headroom4452-a29-${{ github.run_id }}-${{ matrix.lane }}
+          path: ${{ runner.temp }}/headroom4452-${{ matrix.lane }}
+          if-no-files-found: error
+          retention-days: 7
