@@ -1,0 +1,440 @@
+#!/usr/bin/env python3
+"""Non-counted preparation-only smoke for Headroom #4452 attempt 26.
+
+Builds each lane image from the frozen PR head and probes prepared assets offline.
+It never applies a patch and never runs the upstream pytest or Cargo suites.
+"""
+import sys
+
+if sys.flags.optimize:
+    raise SystemExit("OPTIMIZE_FORBIDDEN")
+sys.dont_write_bytecode = True
+
+import argparse  # noqa: E402
+import ctypes  # noqa: E402
+import json  # noqa: E402
+import os  # noqa: E402
+from pathlib import Path  # noqa: E402
+import re  # noqa: E402
+import shutil  # noqa: E402
+import subprocess  # noqa: E402
+import tempfile  # noqa: E402
+import time  # noqa: E402
+
+HERE = Path(__file__).resolve().parent
+SPEC_PATH = HERE / "spec.json"
+LANES = ("source-gates", "python-proof", "rust-workspace", "ci-python-commitlint")
+BOOKWORM_APT_PACKAGES = frozenset({
+    "build-essential", "ca-certificates", "cmake", "curl", "git", "make", "nodejs", "npm",
+    "patchelf", "pkg-config",
+})
+WORK_FILE_ENV_KEYS = frozenset({"COVERAGE_FILE", "HEADROOM_MEMORY_DB_PATH"})
+PROBE_EXTRA_WORK_DIRECTORIES = ("/work/cache/mypy-hook",)
+# Schema for any unavoidable future drift: key -> {"hosted": value,
+# "smoke": value, "reason": nonempty explanation}.  Empty today because the
+# smoke must exercise the counted environment without value differences.
+PROBE_ENV_COMMON_EXCEPTIONS = {}
+
+
+class Stop(RuntimeError):
+    pass
+
+
+def need(value, message):
+    if not value:
+        raise Stop(message)
+
+
+def strict_json(path):
+    def reject(value):
+        raise ValueError("non-finite JSON: " + value)
+    return json.loads(Path(path).read_text(encoding="utf-8"), parse_constant=reject)
+
+
+def save(path, value):
+    text = json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    json.loads(text)
+    tmp = Path(str(path) + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def save_command_evidence(evidence, stem, result, output):
+    """Persist raw command evidence before checking exit status or parsing output."""
+    evidence = Path(evidence)
+    (evidence / (stem + ".log")).write_text(output, encoding="utf-8")
+    save(evidence / (stem + ".json"), result)
+
+
+def checked_probe_evidence(evidence, probe, output):
+    """Save the complete probe result, then fail on exit before parsing versions."""
+    probe_record = dict(probe)
+    probe_record["output"] = output
+    save_command_evidence(evidence, "version-probes", probe_record, output)
+    need(probe["exit"] == 0,
+         "VERSION_PROBES exit=%d\n%s" % (probe["exit"], output[-2000:]))
+    return rust_toolchain_versions(output)
+
+
+def bounded(argv, *, timeout, cap=64 * 1024 * 1024, cwd=None, env=None):
+    begin = time.monotonic()
+    proc = subprocess.run(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT, timeout=timeout, check=False)
+    need(len(proc.stdout) <= cap, "OUTPUT_CAP")
+    return {"argv": argv, "exit": proc.returncode,
+            "elapsed_monotonic_seconds": time.monotonic() - begin,
+            "output": proc.stdout.decode("utf-8", "replace")}
+
+
+def validate_bookworm_apt_packages(text):
+    marker = "apt-get install -y --no-install-recommends "
+    lines = [line for line in text.splitlines() if marker in line]
+    need(len(lines) == 1, "APT_INSTALL_FORM")
+    requested = frozenset(lines[0].split(marker, 1)[1].split("&&", 1)[0].strip().split())
+    missing = sorted(requested - BOOKWORM_APT_PACKAGES)
+    need(not missing, "APT_PACKAGE_NOT_IN_BOOKWORM " + ",".join(missing))
+    need(requested == BOOKWORM_APT_PACKAGES, "APT_PACKAGE_SET")
+    return sorted(requested)
+
+
+def prepare_build_context(source, root, spec):
+    """Use an outer context so the checkout's nested .dockerignore filters nothing."""
+    source, root = Path(source), Path(root)
+    wrapped = root / "source"
+    shutil.copytree(source, wrapped, symlinks=True)
+    need((wrapped / ".git").exists(), "BUILD_CONTEXT_GIT")
+    need((wrapped / ".pre-commit-config.yaml").is_file(), "BUILD_CONTEXT_PRE_COMMIT_CONFIG")
+    need((wrapped / "tests/test_memory_bridge.py").is_file(), "BUILD_CONTEXT_TESTS")
+    for commit in (spec["commitlint_from"], spec["commitlint_to"], spec["pr_head"]):
+        found = bounded(["git", "cat-file", "-e", commit + "^{commit}"], cwd=wrapped, timeout=30)
+        need(found["exit"] == 0, "BUILD_CONTEXT_COMMIT " + commit)
+    clean = bounded(["git", "status", "--porcelain=v1", "--ignored=matching",
+                     "--untracked-files=all"], cwd=wrapped, timeout=60)
+    need(clean["exit"] == 0 and not clean["output"].strip(), "BUILD_CONTEXT_NOT_CLEAN")
+    return root
+
+
+def dockerfile(spec):
+    enc = json.dumps(spec["tiktoken_encodings"])
+    model = spec["model"]
+    text = f'''FROM {spec["rust_image"]} AS rust-toolchain
+RUN rustup component add rustfmt clippy --toolchain 1.95.0 \\
+ && rustc --version | grep -E '^rustc {spec["rust"]} \\([0-9a-f]+ [0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}\\)$' \\
+ && cargo --version && rustfmt --version && cargo clippy --version
+
+FROM {spec["container_image"]}
+ENV DEBIAN_FRONTEND=noninteractive PIP_DISABLE_PIP_VERSION_CHECK=1 PYTHONDONTWRITEBYTECODE=1 \\
+    PATH=/usr/local/cargo/bin:/opt/venv/bin:/usr/local/bin:/usr/bin:/bin \\
+    RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo
+COPY --from=rust-toolchain /usr/local/cargo /usr/local/cargo
+COPY --from=rust-toolchain /usr/local/rustup /usr/local/rustup
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential ca-certificates cmake curl git make nodejs npm patchelf pkg-config && rm -rf /var/lib/apt/lists/*
+RUN rustc --version | grep -E '^rustc {spec["rust"]} \\([0-9a-f]+ [0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}\\)$' \\
+ && cargo --version && rustfmt --version && cargo clippy --version \\
+ && node_major="$(node --version | sed -E 's/^v([0-9]+).*/\\1/')" && test "$node_major" -ge 18 \\
+ && npm --version
+WORKDIR /src
+COPY source/ /src
+RUN uv venv /opt/venv --python 3.12 && UV_PROJECT_ENVIRONMENT=/opt/venv uv sync --frozen --extra dev --extra langchain --extra proxy --no-install-project && uv pip install --python /opt/venv/bin/python "maturin>=1.5,<2.0" && /opt/venv/bin/maturin --version
+RUN /opt/venv/bin/python - <<'PY'
+import ctypes
+import pathlib
+import onnxruntime
+
+version = tuple(int(part) for part in onnxruntime.__version__.split('.')[:2])
+assert version >= (1, 24), onnxruntime.__version__
+capi = pathlib.Path(onnxruntime.__file__).parent / "capi"
+libs = sorted(capi.glob("libonnxruntime.so*"))
+assert libs, capi
+target = pathlib.Path("/opt/onnxruntime")
+target.mkdir()
+(target / "libonnxruntime.so").symlink_to(libs[0])
+resolved = (target / "libonnxruntime.so").resolve(strict=True)
+ctypes.CDLL(str(target / "libonnxruntime.so"))
+print(f"onnxruntime {{onnxruntime.__version__}} -> {{libs[0]}}")
+PY
+ENV ORT_DYLIB_PATH=/opt/onnxruntime/libonnxruntime.so
+RUN cargo fetch --locked
+RUN mkdir -p /opt/hf /opt/tiktoken /opt/precommit /opt/npm-cache /opt/work /opt/precommit-repo \
+ && git init -q /opt/precommit-repo \
+ && cp /src/.pre-commit-config.yaml /opt/precommit-repo/.pre-commit-config.yaml \
+ && test -z "$(find /opt/precommit-repo -mindepth 1 -maxdepth 1 ! -name .git ! -name .pre-commit-config.yaml -print -quit)" \
+ && cd /opt/precommit-repo \
+ && HOME=/opt/work PRE_COMMIT_HOME=/opt/precommit /opt/venv/bin/pre-commit install-hooks \
+ && cp -a /opt/precommit /opt/precommit-seed
+RUN HOME=/opt/work npm_config_cache=/opt/npm-cache npx --yes --package=@commitlint/cli@{spec["commitlint"]} --package=@commitlint/config-conventional@{spec["commitlint"]} -- commitlint --version \
+ && cp -a /opt/npm-cache /opt/npm-cache-seed
+RUN HOME=/opt/work HF_HOME=/opt/hf HF_HUB_DISABLE_TELEMETRY=1 HF_HUB_DISABLE_IMPLICIT_TOKEN=1 /opt/venv/bin/python - <<'PY'
+from huggingface_hub import snapshot_download
+path = snapshot_download({model["repo"]!r}, revision={model["revision"]!r})
+assert path.endswith({model["revision"]!r}), path
+PY
+RUN HOME=/opt/work TIKTOKEN_CACHE_DIR=/opt/tiktoken /opt/venv/bin/python - <<'PY'
+import tiktoken
+for name in {enc}:
+    tiktoken.get_encoding(name)
+PY
+'''
+    validate_bookworm_apt_packages(text)
+    return text
+
+
+def inspect_local_image(reference):
+    result = bounded(["docker", "image", "inspect", reference, "--format", "{{json .}}"], timeout=30)
+    if result["exit"] != 0:
+        return None
+    info = json.loads(result["output"])
+    image_id = info.get("Id")
+    repo_digests = info.get("RepoDigests", [])
+    need(isinstance(image_id, str) and image_id.startswith("sha256:"), "IMAGE_ID " + reference)
+    need(isinstance(repo_digests, list) and all(isinstance(x, str) for x in repo_digests),
+         "REPO_DIGESTS " + reference)
+    return {"reference": reference, "id": image_id, "repo_digests": sorted(repo_digests)}
+
+
+def inspect_uv_base(reference):
+    """Ensure the final-stage base is in the local image store before inspecting it."""
+    image = inspect_local_image(reference)
+    pulled_for_identity = image is None
+    if pulled_for_identity:
+        pulled = bounded(["docker", "pull", reference], timeout=15 * 60)
+        need(pulled["exit"] == 0, "IMAGE_PULL " + reference + "\n" + pulled["output"][-2000:])
+        image = inspect_local_image(reference)
+    need(image is not None, "IMAGE_INSPECT " + reference)
+    image["pulled_for_identity"] = pulled_for_identity
+    digest = reference.rsplit("@", 1)[1]
+    need(any(value.endswith("@" + digest) for value in image["repo_digests"]),
+         "PINNED_REPO_DIGEST container_base")
+    return image
+
+
+def resolved_images(spec, lane_tag, rust_stage):
+    """Inspect only images that are expected in the local store; Rust is a build stage."""
+    lane = inspect_local_image(lane_tag)
+    need(lane is not None, "IMAGE_INSPECT " + lane_tag)
+    images = {
+        "rust_stage": rust_stage,
+        "container_base": inspect_uv_base(spec["container_image"]),
+        "lane": lane,
+    }
+    return images
+
+
+def rust_toolchain_versions(output):
+    """Parse exact tool versions, accepting bare or BuildKit plain-progress lines."""
+    prefix = re.compile(r"^#(?P<step>\d+)\s+\d+(?:\.\d+)?\s+(?P<text>.*)$")
+    stage_steps = {match.group(1) for line in output.splitlines()
+                   if (match := re.match(r"^#(\d+)\s+\[rust-toolchain \d+/\d+\]", line))}
+    patterns = {
+        "rustc": re.compile(r"rustc 1\.95\.0 \([0-9a-f]+ \d{4}-\d{2}-\d{2}\)"),
+        "cargo": re.compile(r"cargo 1\.95\.0 \([0-9a-f]+ \d{4}-\d{2}-\d{2}\)"),
+        "rustfmt": re.compile(r"rustfmt \S+(?: \([^\r\n]+\))?"),
+        "clippy": re.compile(r"clippy 0\.1\.95 \([0-9a-f]+ \d{4}-\d{2}-\d{2}\)"),
+    }
+    versions = {}
+    for raw in output.splitlines():
+        line = raw.strip()
+        buildkit = prefix.fullmatch(line)
+        if buildkit:
+            if stage_steps and buildkit.group("step") not in stage_steps:
+                continue
+            line = buildkit.group("text").strip()
+        for name, pattern in patterns.items():
+            if name not in versions and pattern.fullmatch(line):
+                versions[name] = line
+    need(set(versions) == set(patterns), "RUST_TOOLCHAIN_VERSION_EVIDENCE")
+    return versions
+
+
+def rust_stage_identity(build_log, spec):
+    """Bind the BuildKit-only Rust stage to its FROM digest and copied-tool probes."""
+    digest = spec["rust_image"].rsplit("@", 1)[1]
+    from_lines = [line.strip() for line in build_log.splitlines()
+                  if re.search(r"\[rust-toolchain 1/\d+\] FROM ", line) and digest in line]
+    need(from_lines, "RUST_STAGE_FROM_EVIDENCE")
+    return {"reference": spec["rust_image"], "digest": digest,
+            "build_log_from": from_lines[-1],
+            "tool_versions": rust_toolchain_versions(build_log),
+            "identity_method": "buildkit_from_digest_plus_in_image_tool_versions",
+            "image_inspected": False}
+
+
+def probe_env():
+    env = os.environ.copy()
+    env.update({
+        # Keep this block value-identical to hosted.py::common_env().  The smoke
+        # proves the counted runtime environment, while retaining its seeded
+        # pre-commit/npm caches and offline HF/tiktoken/ORT probes.
+        "PATH": "/opt/venv/bin:/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin",
+        "VIRTUAL_ENV": "/opt/venv", "PYO3_PYTHON": "/opt/venv/bin/python",
+        "PIP_NO_INDEX": "1", "PIP_NO_BUILD_ISOLATION": "1", "CARGO_TARGET_DIR": "/work/target",
+        "HOME": "/work/home", "TMPDIR": "/work/tmp", "PYTHONDONTWRITEBYTECODE": "1",
+        "RUFF_CACHE_DIR": "/work/cache/ruff", "MYPY_CACHE_DIR": "/work/cache/mypy",
+        "PIP_CACHE_DIR": "/work/cache/pip", "PYTHONPYCACHEPREFIX": "/work/cache/pycache",
+        "XDG_CACHE_HOME": "/work/cache/xdg", "UV_CACHE_DIR": "/work/cache/uv",
+        "COVERAGE_FILE": "/work/cache/coverage/.coverage", "PRE_COMMIT_HOME": "/opt/precommit",
+        "CARGO_NET_OFFLINE": "true", "HF_HOME": "/opt/hf", "HF_HUB_OFFLINE": "1",
+        "TRANSFORMERS_OFFLINE": "1", "HF_HUB_DISABLE_IMPLICIT_TOKEN": "1",
+        "HF_HUB_DISABLE_TELEMETRY": "1", "TIKTOKEN_CACHE_DIR": "/opt/tiktoken",
+        "npm_config_cache": "/opt/npm-cache", "npm_config_offline": "true",
+        "ORT_DYLIB_PATH": "/opt/onnxruntime/libonnxruntime.so",
+        "HEADROOM_WORKSPACE_DIR": "/work/headroom", "HEADROOM_CONFIG_DIR": "/work/headroom/config",
+        "HEADROOM_MEMORY_DB_PATH": "/work/headroom/memory.db", "CLAUDE_CONFIG_DIR": "/work/claude",
+        "HEADROOM_BEACON": "off", "HEADROOM_TELEMETRY": "off", "HEADROOM_UPDATE_CHECK": "off",
+        "HEADROOM_PORT_DISCOVERY": "0", "HEADROOM_HARD_WATCHDOG_SECS": "0",
+        "TOKENIZERS_PARALLELISM": "false", "OMP_NUM_THREADS": "2", "MKL_NUM_THREADS": "2",
+        "NO_COLOR": "1",
+    })
+    return env
+
+
+def probe_work_directories(env):
+    """Return every directory named by a /work environment value."""
+    directories = list(PROBE_EXTRA_WORK_DIRECTORIES)
+    for key, value in sorted(env.items()):
+        if value != "/work" and not value.startswith("/work/"):
+            continue
+        path = Path(value).parent if key in WORK_FILE_ENV_KEYS else Path(value)
+        directories.append(str(path))
+    return sorted(set(directories))
+
+
+def create_probe_work_directories(env):
+    """Create every directory named by a /work environment value before probes."""
+    directories = probe_work_directories(env)
+    for value in directories:
+        path = Path(value)
+        path.mkdir(parents=True, exist_ok=True)
+    return directories
+
+
+def inside_probe():
+    """Exercise every prepared cache with networking disabled by the outer Docker call."""
+    spec = strict_json(SPEC_PATH)
+    env = probe_env()
+    create_probe_work_directories(env)
+    for seed, destination in ((Path("/opt/precommit-seed"), Path("/opt/precommit")),
+                              (Path("/opt/npm-cache-seed"), Path("/opt/npm-cache"))):
+        need(seed.is_dir() and destination.is_dir(), "PROBE_CACHE_MOUNT " + str(destination))
+        shutil.copytree(seed, destination, dirs_exist_ok=True, symlinks=True)
+    changed = ["headroom/memory/bridge.py", "tests/test_memory_bridge.py"]
+    tail = ["--hook-stage", "pre-commit", "--show-diff-on-failure", "--color", "never",
+            "--files"] + changed
+    commands = [
+        ("tool-versions", ["bash", "-c", "rustc --version && cargo --version && rustfmt --version && cargo clippy --version && node --version && npm --version && python --version && uv --version && pre-commit --version && maturin --version"]),
+        ("git-repository", ["git", "rev-parse", "--is-inside-work-tree"]),
+        ("commitlint-from", ["git", "cat-file", "-e", spec["commitlint_from"] + "^{commit}"]),
+        ("pre-commit", ["pre-commit", "run"] + tail),
+        ("pre-commit-mypy", ["pre-commit", "run", "mypy"] + tail),
+        ("commitlint-range", ["npx", "--offline", "--yes", "--package=@commitlint/cli@" + spec["commitlint"],
+         "--package=@commitlint/config-conventional@" + spec["commitlint"], "--", "commitlint",
+         "--from", spec["commitlint_from"], "--to", spec["commitlint_to"],
+         "--config", "/src/.commitlintrc.json"]),
+    ]
+    outputs = []
+    for label, argv in commands:
+        command_env = env.copy()
+        if label == "pre-commit":
+            command_env["SKIP"] = "mypy"
+        elif label == "pre-commit-mypy":
+            command_env["MYPY_CACHE_DIR"] = "/work/cache/mypy-hook"
+        result = bounded(argv, cwd="/src", env=command_env, timeout=10 * 60)
+        bounded_output = result["output"][-256 * 1024:]
+        record = "OFFLINE_PROBE_STEP %s exit=%d\n%s" % (label, result["exit"], bounded_output)
+        print(record, flush=True)
+        outputs.append(record)
+        need(result["exit"] == 0,
+             "OFFLINE_PROBE_STEP %s exit=%d\n%s" %
+             (label, result["exit"], result["output"][-2000:]))
+    os.environ.update(env)
+    from huggingface_hub import snapshot_download
+    model = spec["model"]
+    snapshot = snapshot_download(model["repo"], revision=model["revision"], local_files_only=True)
+    need(snapshot.endswith(model["revision"]), "OFFLINE_HF_SNAPSHOT")
+    import tiktoken
+    for name in spec["tiktoken_encodings"]:
+        tiktoken.get_encoding(name)
+    ctypes.CDLL(env["ORT_DYLIB_PATH"])
+    outputs.append(json.dumps({"offline_hf": model["revision"],
+                               "offline_tiktoken": spec["tiktoken_encodings"],
+                               "offline_ort": env["ORT_DYLIB_PATH"],
+                               "offline_pre_commit": True,
+                               "offline_commitlint_range": [spec["commitlint_from"],
+                                                             spec["commitlint_to"]]}, sort_keys=True))
+    print("OFFLINE_PROBE_ASSETS " + outputs[-1], flush=True)
+    return 0
+
+
+def run(args):
+    spec = strict_json(SPEC_PATH)
+    need(args.lane in LANES and spec["lanes"] == list(LANES), "LANE")
+    evidence = Path(args.evidence)
+    evidence.mkdir(parents=True, exist_ok=False)
+    started = time.monotonic()
+    try:
+        dockerfile_path = evidence / "Dockerfile"
+        dockerfile_path.write_text(dockerfile(spec), encoding="utf-8")
+        tag = "headroom4452-a26h-smoke-" + args.lane
+        with tempfile.TemporaryDirectory(prefix="headroom4452-a26h-smoke-build-") as tmp:
+            context = prepare_build_context(args.source, Path(tmp), spec)
+            shutil.copy2(dockerfile_path, context / "Dockerfile")
+            save(evidence / "build-context.json", {
+                "temporary_outer_context": True,
+                "outside_sealed_source_tree": True,
+                "copy_instruction": "COPY source/ /src",
+                "full_git_history_copied": True,
+                "pre_commit_config_copied": True,
+                "tests_copied": True,
+            })
+            prep = bounded(["docker", "build", "--pull", "--network", "default", "-f",
+                            str(context / "Dockerfile"), "-t", tag, str(context)], timeout=50 * 60)
+        prep_output = prep.pop("output")
+        save_command_evidence(evidence, "preparation", prep, prep_output)
+        need(prep["exit"] == 0, "P0_PREPARATION")
+        tool_versions = rust_toolchain_versions(prep_output)
+        # The executable version/offline probe deliberately precedes identity bookkeeping.
+        probe = bounded(["docker", "run", "--rm", "--network", "none", "--read-only",
+                         "--tmpfs", "/work:rw,exec,nosuid,nodev,size=2g",
+                         "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=128m",
+                         "--tmpfs", "/opt/precommit:rw,exec,nosuid,nodev,size=2g",
+                         "--tmpfs", "/opt/npm-cache:rw,exec,nosuid,nodev,size=512m",
+                         "-v", str(HERE) + ":/runtime:ro", tag, "/opt/venv/bin/python", "-I", "-B",
+                         "/runtime/smoke.py", "--inside-probe"], timeout=15 * 60)
+        probe_output = probe.pop("output")
+        probe_versions = checked_probe_evidence(evidence, probe, probe_output)
+        need(probe_versions == tool_versions, "RUST_TOOLCHAIN_PROBE_MISMATCH")
+        rust_stage = rust_stage_identity(prep_output, spec)
+        images = resolved_images(spec, tag, rust_stage)
+        save(evidence / "resolved-images.json", {"lane": args.lane, "images": images})
+        save(evidence / "smoke-summary.json", {"schema": "headroom4452-a26h-smoke-lane/1",
+             "lane": args.lane, "status": "PASS", "counted_attempt": False,
+             "project_tests_run": False, "candidate_patch_applied": False,
+             "offline_preparation_assets_probed": True,
+             "resolved_images": images,
+             "rust_toolchain_versions": tool_versions,
+             "elapsed_monotonic_seconds": time.monotonic() - started})
+        return 0
+    except (Stop, OSError, subprocess.TimeoutExpired, ValueError) as exc:
+        save(evidence / "smoke-summary.json", {"schema": "headroom4452-a26h-smoke-lane/1",
+             "lane": args.lane, "status": "FAIL", "counted_attempt": False,
+             "project_tests_run": False, "candidate_patch_applied": False,
+             "error": type(exc).__name__ + ": " + str(exc)[:2000],
+             "elapsed_monotonic_seconds": time.monotonic() - started})
+        return 4
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--lane", choices=LANES)
+    parser.add_argument("--source")
+    parser.add_argument("--evidence")
+    parser.add_argument("--inside-probe", action="store_true")
+    args = parser.parse_args()
+    if args.inside_probe:
+        raise SystemExit(inside_probe())
+    need(args.lane and args.source and args.evidence, "RUN_ARGUMENTS")
+    raise SystemExit(run(args))
+
+
+if __name__ == "__main__":
+    main()
